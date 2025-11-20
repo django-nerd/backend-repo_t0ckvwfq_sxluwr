@@ -1,48 +1,95 @@
 """
-Database Schemas
+Database Schemas for 3ersi.ai (AI Wedding Planner)
 
-Define your MongoDB collection schemas here using Pydantic models.
-These schemas are used for data validation in your application.
-
-Each Pydantic model represents a collection in your database.
-Model name is converted to lowercase for the collection name:
-- User -> "user" collection
-- Product -> "product" collection
-- BlogPost -> "blogs" collection
+Each Pydantic model represents a MongoDB collection. The collection name is the
+lowercase of the class name (e.g., Vendor -> "vendor").
 """
-
+from typing import List, Optional, Literal
 from pydantic import BaseModel, Field
-from typing import Optional
 
-# Example schemas (replace with your own):
+Region = Literal["lebanon", "gcc", "egypt"]
+Currency = Literal["USD", "LBP", "AED", "SAR", "EGP"]
 
-class User(BaseModel):
-    """
-    Users collection schema
-    Collection name: "user" (lowercase of class name)
-    """
-    name: str = Field(..., description="Full name")
-    email: str = Field(..., description="Email address")
-    address: str = Field(..., description="Address")
-    age: Optional[int] = Field(None, ge=0, le=120, description="Age in years")
-    is_active: bool = Field(True, description="Whether user is active")
+class UserPreference(BaseModel):
+    full_name: str = Field(..., description="Couple or user's full name")
+    email: str = Field(..., description="Contact email")
+    phone: Optional[str] = Field(None, description="Contact phone (optional)")
+    region: Region = Field(..., description="Primary market/region")
+    city: Optional[str] = Field(None, description="Preferred city")
+    wedding_date: Optional[str] = Field(None, description="Target date (ISO or text)")
+    guest_count: int = Field(..., ge=1, le=2000)
+    style: Optional[str] = Field(None, description="Wedding style e.g. classic, boho, luxury")
+    budget: float = Field(..., ge=0)
+    currency: Currency = Field("USD")
 
-class Product(BaseModel):
-    """
-    Products collection schema
-    Collection name: "product" (lowercase of class name)
-    """
-    title: str = Field(..., description="Product title")
-    description: Optional[str] = Field(None, description="Product description")
-    price: float = Field(..., ge=0, description="Price in dollars")
-    category: str = Field(..., description="Product category")
-    in_stock: bool = Field(True, description="Whether product is in stock")
+class Vendor(BaseModel):
+    name: str
+    category: Literal[
+        "venue", "planner", "photography", "videography", "catering",
+        "music", "zaffe", "makeup", "hair", "florals", "decor",
+        "lighting", "dj", "band", "cake", "stationery", "transport"
+    ]
+    region: Region
+    city: Optional[str] = None
+    description: Optional[str] = None
+    languages: List[str] = Field(default_factory=list)
+    price_tier: Literal["$, $$, $$$, $$$$"] = "$$"
+    average_price_usd: Optional[float] = Field(None, ge=0)
+    capacity: Optional[int] = Field(None, ge=1)
+    images: List[str] = Field(default_factory=list)
+    contact_phone: Optional[str] = None
+    contact_email: Optional[str] = None
+    website: Optional[str] = None
+    instagram: Optional[str] = None
+    featured: bool = False
 
-# Add your own schemas here:
-# --------------------------------------------------
+class Venue(BaseModel):
+    name: str
+    region: Region
+    city: Optional[str] = None
+    capacity: int = Field(..., ge=10)
+    indoor: bool = True
+    outdoor: bool = False
+    sea_view: bool = False
+    luxury_level: Literal["boutique", "premium", "ultra"] = "premium"
+    average_price_usd: Optional[float] = Field(None, ge=0)
+    images: List[str] = Field(default_factory=list)
 
-# Note: The Flames database viewer will automatically:
-# 1. Read these schemas from GET /schema endpoint
-# 2. Use them for document validation when creating/editing
-# 3. Handle all database operations (CRUD) directly
-# 4. You don't need to create any database endpoints!
+class Package(BaseModel):
+    vendor_id: Optional[str] = None
+    title: str
+    description: Optional[str] = None
+    items: List[str] = Field(default_factory=list)
+    price_usd: float = Field(..., ge=0)
+
+class Inquiry(BaseModel):
+    name: str
+    email: str
+    phone: Optional[str] = None
+    vendor_id: Optional[str] = None
+    message: str
+    region: Optional[Region] = None
+
+class ChecklistItem(BaseModel):
+    label: str
+    category: Literal[
+        "planning", "venue", "attire", "beauty", "decor", "florals", "media",
+        "entertainment", "food", "logistics", "paperwork", "traditions"
+    ]
+    due_months_before: int = Field(..., ge=0, le=24)
+    optional: bool = False
+
+class WeddingPlan(BaseModel):
+    preference_id: Optional[str] = None
+    region: Region
+    currency: Currency
+    guest_count: int
+    total_budget: float
+    timeline: List[dict] = Field(default_factory=list)
+    categories: List[str] = Field(default_factory=list)
+
+class BudgetItem(BaseModel):
+    category: str
+    allocation_percent: float
+    amount: float
+    notes: Optional[str] = None
