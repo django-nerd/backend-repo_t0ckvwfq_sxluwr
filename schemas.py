@@ -5,10 +5,28 @@ Each Pydantic model represents a MongoDB collection. The collection name is the
 lowercase of the class name (e.g., Vendor -> "vendor").
 """
 from typing import List, Optional, Literal
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, EmailStr
 
 Region = Literal["lebanon", "gcc", "egypt"]
 Currency = Literal["USD", "LBP", "AED", "SAR", "EGP"]
+
+class User(BaseModel):
+    email: EmailStr
+    full_name: Optional[str] = None
+    password: Optional[str] = None  # write-only on input
+
+class UserPublic(BaseModel):
+    id: str
+    email: EmailStr
+    full_name: Optional[str] = None
+
+class LoginRequest(BaseModel):
+    email: EmailStr
+    password: str
+
+class TokenResponse(BaseModel):
+    access_token: str
+    token_type: str = "bearer"
 
 class UserPreference(BaseModel):
     full_name: str = Field(..., description="Couple or user's full name")
@@ -93,3 +111,12 @@ class BudgetItem(BaseModel):
     allocation_percent: float
     amount: float
     notes: Optional[str] = None
+
+class PlanCreate(BaseModel):
+    title: Optional[str] = None
+    data: dict
+
+class PlanPublic(BaseModel):
+    id: str
+    title: Optional[str] = None
+    data: dict

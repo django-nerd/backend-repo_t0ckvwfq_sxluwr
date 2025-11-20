@@ -1,15 +1,20 @@
 import os
+from datetime import datetime, timedelta, timezone
 from typing import List, Optional, Dict, Any
-from fastapi import FastAPI, HTTPException, Query
+
+import jwt
+from fastapi import FastAPI, HTTPException, Query, Depends, Header
 from fastapi.middleware.cors import CORSMiddleware
+from passlib.context import CryptContext
 from pydantic import BaseModel
 
 from database import db, create_document, get_documents
 from schemas import (
-    UserPreference, Vendor, Venue, Package, Inquiry, ChecklistItem, WeddingPlan, BudgetItem
+    UserPreference, Vendor, Venue, Package, Inquiry, ChecklistItem, WeddingPlan, BudgetItem,
+    User, UserPublic, LoginRequest, TokenResponse, PlanCreate, PlanPublic
 )
 
-app = FastAPI(title="3ersi.ai API", version="1.1.0")
+app = FastAPI(title="3ersi.ai API", version="1.2.0")
 
 app.add_middleware(
     CORSMiddleware,
@@ -19,10 +24,57 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
+# ---------- Auth Setup ----------
+SECRET_KEY = os.getenv("JWT_SECRET", "dev-secret-change-me")
+ALGORITHM = "HS256"
+ACCESS_TOKEN_EXPIRE_DAYS = 7
+pwd_context = CryptContext(schemes=["bcrypt"], deprecated="auto")
+
+
+def hash_password(password: str) -> str:
+    return pwd_context.hash(password)
+
+
+def verify_password(password: str, password_hash: str) -> bool:
+    try:
+        return pwd_context.verify(password, password_hash)
+    except Exception:
+        return False
+
+
+def create_access_token(data: dict, expires_delta: Optional[timedelta] = None) -> str:
+    to_encode = data.copy()
+    expire = datetime.now(timezone.utc) + (expires_delta or timedelta(days=ACCESS_TOKEN_EXPIRE_DAYS))
+    to_encode.update({"exp": expire})
+    return jwt.encode(to_encode, SECRET_KEY, algorithm=ALGORITHM)
+
+
+async def get_current_user(authorization: Optional[str] = Header(None)) -> dict:
+    if not authorization or not authorization.lower().startswith("bearer "):
+        raise HTTPException(status_code=401, detail="Not authenticated")
+    token = authorization.split(" ", 1)[1]
+    try:
+        payload = jwt.decode(token, SECRET_KEY, algorithms=[ALGORITHM])
+        user_id = payload.get("sub")
+        if not user_id:
+            raise HTTPException(status_code=401, detail="Invalid token")
+        from bson import ObjectId
+        doc = db["user"].find_one({"_id": ObjectId(user_id)}) if db else None
+        if not doc:
+            raise HTTPException(status_code=401, detail="User not found")
+        doc["id"] = str(doc.pop("_id"))
+        # Remove sensitive fields if present
+        doc.pop("password_hash", None)
+        return doc
+    except jwt.ExpiredSignatureError:
+        raise HTTPException(status_code=401, detail="Token expired")
+    except Exception:
+        raise HTTPException(status_code=401, detail="Could not validate credentials")
+
 
 @app.get("/")
 def read_root():
-    return {"message": "3ersi.ai backend running", "version": "1.1.0"}
+    return {"message": "3ersi.ai backend running", "version": "1.2.0"}
 
 
 @app.get("/api/hello")
@@ -78,6 +130,7 @@ def get_schema():
         return {k: str(v.annotation) for k, v in model.model_fields.items()}
 
     return [
+        SchemaInfo(name="user", fields=model_fields(User)),
         SchemaInfo(name="userpreference", fields=model_fields(UserPreference)),
         SchemaInfo(name="vendor", fields=model_fields(Vendor)),
         SchemaInfo(name="venue", fields=model_fields(Venue)),
@@ -86,7 +139,43 @@ def get_schema():
         SchemaInfo(name="checklistitem", fields=model_fields(ChecklistItem)),
         SchemaInfo(name="weddingplan", fields=model_fields(WeddingPlan)),
         SchemaInfo(name="budgetitem", fields=model_fields(BudgetItem)),
+        SchemaInfo(name="plan", fields={"title": "str", "data": "dict", "owner_id": "str"}),
     ]
+
+
+# ---------- Auth Endpoints ----------
+@app.post("/auth/register", response_model=UserPublic)
+def register(user: User):
+    if not db:
+        raise HTTPException(status_code=500, detail="Database not available")
+    existing = db["user"].find_one({"email": user.email.lower()})
+    if existing:
+        raise HTTPException(status_code=400, detail="Email already registered")
+    doc = {
+        "email": user.email.lower(),
+        "full_name": user.full_name or "",
+        "password_hash": hash_password(user.password or ""),
+        "created_at": datetime.now(timezone.utc),
+        "updated_at": datetime.now(timezone.utc),
+    }
+    res = db["user"].insert_one(doc)
+    return UserPublic(id=str(res.inserted_id), email=doc["email"], full_name=doc["full_name"])
+
+
+@app.post("/auth/login", response_model=TokenResponse)
+def login(req: LoginRequest):
+    if not db:
+        raise HTTPException(status_code=500, detail="Database not available")
+    user = db["user"].find_one({"email": req.email.lower()})
+    if not user or not verify_password(req.password, user.get("password_hash", "")):
+        raise HTTPException(status_code=401, detail="Invalid email or password")
+    token = create_access_token({"sub": str(user["_id"])})
+    return TokenResponse(access_token=token)
+
+
+@app.get("/auth/me", response_model=UserPublic)
+def me(current=Depends(get_current_user)):
+    return UserPublic(id=current["id"], email=current["email"], full_name=current.get("full_name"))
 
 
 # ---------- FX + Currency Helpers ----------
@@ -195,6 +284,9 @@ def get_vendor(vendor_id: str):
     if not doc:
         raise HTTPException(status_code=404, detail="Vendor not found")
     doc["_id"] = str(doc["_id"])
+    avg = doc.get("average_price_usd")
+    if isinstance(avg, (int, float)):
+        doc["price_converted"] = {cur: convert(avg, cur) for cur in ["USD", "AED", "SAR", "EGP", "LBP"]}
     return doc
 
 
@@ -349,6 +441,69 @@ def assist(req: AssistRequest):
         tips = ["أخبريني بالمنطقة والميزانية والأسلوب لنقترح خطة أدق ✨"]
 
     return {"reply": "\n".join(tips)}
+
+
+# ---------- Saved Plans (Auth required) ----------
+@app.post("/api/plans", response_model=PlanPublic)
+def create_plan(plan: PlanCreate, current=Depends(get_current_user)):
+    from bson import ObjectId
+    doc = {
+        "owner_id": ObjectId(current["id"]),
+        "title": plan.title or "My Wedding Plan",
+        "data": plan.data,
+        "created_at": datetime.now(timezone.utc),
+        "updated_at": datetime.now(timezone.utc),
+    }
+    res = db["plan"].insert_one(doc)
+    return PlanPublic(id=str(res.inserted_id), title=doc["title"], data=doc["data"])
+
+
+@app.get("/api/plans", response_model=List[PlanPublic])
+def list_plans(current=Depends(get_current_user)):
+    from bson import ObjectId
+    items = []
+    for p in db["plan"].find({"owner_id": ObjectId(current["id"])}).sort("created_at", -1):
+        items.append(PlanPublic(id=str(p["_id"]), title=p.get("title"), data=p.get("data")))
+    return items
+
+
+@app.get("/api/plans/{plan_id}", response_model=PlanPublic)
+def get_plan(plan_id: str, current=Depends(get_current_user)):
+    from bson import ObjectId
+    try:
+        p = db["plan"].find_one({"_id": ObjectId(plan_id)})
+    except Exception:
+        p = None
+    if not p or str(p.get("owner_id")) != current["id"]:
+        raise HTTPException(status_code=404, detail="Plan not found")
+    return PlanPublic(id=str(p["_id"]), title=p.get("title"), data=p.get("data"))
+
+
+@app.put("/api/plans/{plan_id}", response_model=PlanPublic)
+def update_plan(plan_id: str, plan: PlanCreate, current=Depends(get_current_user)):
+    from bson import ObjectId
+    try:
+        p = db["plan"].find_one({"_id": ObjectId(plan_id)})
+    except Exception:
+        p = None
+    if not p or str(p.get("owner_id")) != current["id"]:
+        raise HTTPException(status_code=404, detail="Plan not found")
+    db["plan"].update_one({"_id": p["_id"]}, {"$set": {"title": plan.title or p.get("title"), "data": plan.data, "updated_at": datetime.now(timezone.utc)}})
+    p2 = db["plan"].find_one({"_id": p["_id"]})
+    return PlanPublic(id=str(p2["_id"]), title=p2.get("title"), data=p2.get("data"))
+
+
+@app.delete("/api/plans/{plan_id}")
+def delete_plan(plan_id: str, current=Depends(get_current_user)):
+    from bson import ObjectId
+    try:
+        p = db["plan"].find_one({"_id": ObjectId(plan_id)})
+    except Exception:
+        p = None
+    if not p or str(p.get("owner_id")) != current["id"]:
+        raise HTTPException(status_code=404, detail="Plan not found")
+    db["plan"].delete_one({"_id": p["_id"]})
+    return {"ok": True}
 
 
 if __name__ == "__main__":
